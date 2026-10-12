@@ -7,7 +7,9 @@ authors = [
     { name = "Arpit Krishna", email = "arpit.krishna@carinfo.app" }
 ]
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "pydantic>=2.14.1",
+]
 
 [project.scripts]
 oncall-copilot = "oncall_copilot:main"
@@ -15,3 +17,9 @@ oncall-copilot = "oncall_copilot:main"
 [build-system]
 requires = ["uv_build>=0.13.0,<0.14.0"]
 build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.17.0",
+]
