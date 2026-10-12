@@ -1,6 +1,6 @@
 from datetime import datetime
 from enum import StrEnum
-
+from dataclasses import dataclass, field
 from pydantic import BaseModel, field_validator
 
 
@@ -26,3 +26,9 @@ class LogRecord(BaseModel):
         if isinstance(v, str):
             return datetime.strptime(v, "%a %b %d %H:%M:%S %Y")
         return v
+
+@dataclass
+class LoadResult:
+    records: list[LogRecord] = field(default_factory=list)
+    count: int = 0
+    skipped: int = 0
