@@ -1,0 +1,3 @@
+# Learning log
+
+- **Day 1 (12 Oct):** Built … / Broke … / Learned …
