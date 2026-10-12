@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 authors = [
-    { name = "Arpit Krishna", email = "arpit.krishna@carinfo.app" }
+    { name = "Arpit Krishna", email = "31812csai@gmail.com" }
 ]
 requires-python = ">=3.12"
 dependencies = [
@@ -12,7 +12,7 @@ dependencies = [
 ]
 
 [project.scripts]
-oncall-copilot = "oncall_copilot:main"
+copilot = "oncall_copilot.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.13.0,<0.14.0"]
