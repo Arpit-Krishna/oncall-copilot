@@ -1,5 +1,5 @@
 import argparse
-import logging
+import asyncio
 import sys
 from collections import Counter
 from pathlib import Path
@@ -7,15 +7,17 @@ from pathlib import Path
 import openai
 
 from oncall_copilot.llm import (
-    ConfigError,
+    AllProvidersFailedError,
     EmptyResponseError,
-    LLMConfig,
-    explain_line,
+    PartialResponseError,
+    explain_with_fallback,
     format_footer,
-    make_client,
+    log_call,
 )
 from oncall_copilot.loader import load_file
+from oncall_copilot.logs import configure_logging
 from oncall_copilot.models import LogRecord
+from oncall_copilot.providers import FALLBACK_ORDER, ConfigError, provider_chain
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -32,6 +34,11 @@ def build_parser() -> argparse.ArgumentParser:
     explain_parser = subparsers.add_parser("explain", help="Explain one log line with an LLM")
     explain_parser.add_argument("path", type=Path, help="Path to the data file")
     explain_parser.add_argument("--line", type=int, required=True, help="Line number in the file (1-based)")
+    explain_parser.add_argument(
+        "--provider",
+        choices=FALLBACK_ORDER,
+        help="Provider to try first (default: LLM_PROVIDER, else ollama). Others are fallbacks.",
+    )
 
     return parser
 
@@ -74,28 +81,38 @@ def cmd_explain(args: argparse.Namespace) -> int:
         return error(f"no parsed log record at line {args.line} of {args.path}")
 
     try:
-        config = LLMConfig.from_env()
+        chain = provider_chain(args.provider)
     except ConfigError as e:
         return error(str(e))
 
-    client = make_client(config)
+    # Hold the JSON log lines until the streamed answer is finished, so they don't
+    # land in the middle of it on the terminal.
+    pending_logs: list[dict] = []
+    streamed = False
+
+    def show(piece: str) -> None:
+        nonlocal streamed
+        streamed = True
+        print(piece, end="", flush=True)
+
     try:
-        explanation = explain_line(
-            format_record(record),
-            client,
-            config.model,
-            on_text=lambda piece: print(piece, end="", flush=True),
+        explanation = asyncio.run(
+            explain_with_fallback(chain, format_record(record), on_text=show, log=pending_logs.append)
         )
-    except openai.APIConnectionError:
-        print()
-        return error(f"could not reach the model at {config.base_url}. Is Ollama running?")
+    except AllProvidersFailedError as e:
+        return error(f"{e}. Is Ollama running? Is GROQ_API_KEY set?")
+    except PartialResponseError as e:
+        return error(f"the answer was interrupted: {e}")
     except openai.APIStatusError as e:
-        print()
         return error(f"model API returned HTTP {e.status_code}: {e.message}")
     except EmptyResponseError as e:
         return error(str(e))
+    finally:
+        if streamed:
+            print(flush=True)
+        for entry in pending_logs:
+            log_call(entry)
 
-    print()
     if explanation.finish_reason == "length":
         print("Warning: the answer was cut off at max_tokens", file=sys.stderr)
     # Metadata goes to stderr so stdout holds only the explanation.
@@ -104,7 +121,7 @@ def cmd_explain(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
+    configure_logging()
 
     args = build_parser().parse_args(argv)
     if args.command == "stats":

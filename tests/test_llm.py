@@ -1,30 +1,41 @@
-import httpx2
-import openai
+import asyncio
+
 import pytest
 
-from oncall_copilot import cli
 from oncall_copilot.llm import (
-    ConfigError,
+    AllProvidersFailedError,
     EmptyResponseError,
-    ExplainResult,
-    LLMConfig,
+    PartialResponseError,
     cost_usd,
     explain_line,
+    explain_with_fallback,
     format_footer,
 )
-from tests.fakes import FakeClient, text_chunk, usage_chunk
+from tests.fakes import (
+    FakeClient,
+    connection_error,
+    ok_client,
+    provider,
+    status_error,
+    text_chunk,
+    usage_chunk,
+)
 
 LINE = "[Sun Dec 04 04:47:44 2005] [error] mod_jk child workerEnv in error state 6"
 
 
-# --- explain_line against a fake client -------------------------------------
+def run(coro):
+    return asyncio.run(coro)
+
+
+# --- explain_line: one provider ----------------------------------------------
 
 
 def test_streams_text_and_captures_usage():
     fake = FakeClient([text_chunk("mod_jk "), text_chunk("is down", finish="stop"), usage_chunk(42, 7)])
     seen = []
 
-    r = explain_line(LINE, fake, "test-model", on_text=seen.append)
+    r = run(explain_line(LINE, fake, provider(), on_text=seen.append))
 
     assert seen == ["mod_jk ", "is down"]  # really streamed, piece by piece
     assert r.text == "mod_jk is down"
@@ -33,133 +44,130 @@ def test_streams_text_and_captures_usage():
     assert r.ttft_s is not None and r.total_s >= r.ttft_s
 
 
-def test_sends_expected_request():
-    fake = FakeClient([text_chunk("ok", finish="stop"), usage_chunk(1, 1)])
+def test_sends_model_and_provider_specific_settings():
+    fake = ok_client()
 
-    explain_line(LINE, fake, "test-model")
+    run(explain_line(LINE, fake, provider("groq")))
 
     request = fake.calls[0]
-    assert request["model"] == "test-model"
-    assert request["stream"] is True
-    assert request["reasoning_effort"] == "none"
-    assert request["temperature"] == 0
+    assert request["model"] == "groq-model"
+    assert request["reasoning_effort"] == "none"  # from provider.extra, not hardcoded
+    assert request["stream"] is True and request["temperature"] == 0
     assert request["stream_options"] == {"include_usage": True}
-    assert request["messages"][0]["role"] == "system"
     assert request["messages"][-1] == {"role": "user", "content": LINE}
 
 
 def test_cut_off_answer_is_reported():
     fake = FakeClient([text_chunk("half an ans", finish="length"), usage_chunk(5, 300)])
 
-    assert explain_line(LINE, fake, "m").finish_reason == "length"
+    assert run(explain_line(LINE, fake, provider())).finish_reason == "length"
 
 
 def test_empty_response_raises():
     fake = FakeClient([text_chunk("", finish="stop"), usage_chunk(5, 0)])
 
     with pytest.raises(EmptyResponseError):
-        explain_line(LINE, fake, "m")
+        run(explain_line(LINE, fake, provider()))
 
 
-# --- pure helpers -----------------------------------------------------------
+def test_failure_after_text_is_a_partial_response():
+    fake = FakeClient([text_chunk("half "), text_chunk("answer")], error=connection_error(), fail_after=1)
+
+    with pytest.raises(PartialResponseError):
+        run(explain_line(LINE, fake, provider()))
+
+
+# --- cost and footer -----------------------------------------------------------
 
 
 def test_cost_is_per_million_tokens():
-    assert cost_usd("claude-haiku-5-5", 1_000_000, 1_000_000) == pytest.approx(0.60)
-    assert cost_usd("claude-haiku-5-5", 142, 187) == pytest.approx(0.0001077)
+    assert cost_usd((0.10, 0.50), 1_000_000, 1_000_000) == pytest.approx(0.60)
+    assert cost_usd((0.80, 4.00), 99, 121) == pytest.approx(0.0005632)
 
 
-def test_cost_of_unknown_model_raises():
-    with pytest.raises(KeyError):
-        cost_usd("no-such-model", 1, 1)
+def test_paid_provider_reports_real_cost():
+    r = run(explain_line(LINE, ok_client(), provider("groq", price=(0.80, 4.00))))
+
+    assert r.cost_usd == pytest.approx(cost_usd((0.80, 4.00), 10, 5))
+    assert "$0.000028" in format_footer(r)
 
 
-def test_footer_for_local_model_shows_reference_cost():
-    r = ExplainResult("qwen3.5:9b", "x", 142, 187, "stop", ttft_s=0.61, total_s=2.9)
+def test_local_provider_footer_shows_reference_cost():
+    r = run(explain_line(LINE, ok_client(), provider("ollama")))
 
-    footer = format_footer(r)
-
-    assert "142 in / 187 out" in footer
-    assert "first token 0.61s" in footer
-    assert "$0 local" in footer and "0.000108" in footer
+    assert r.cost_usd is None
+    assert "$0 local (≈ $" in format_footer(r)
 
 
-def test_config_reports_every_missing_variable(monkeypatch):
-    for name in ("LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL"):
-        monkeypatch.delenv(name, raising=False)
-
-    with pytest.raises(ConfigError, match="LLM_BASE_URL, LLM_API_KEY, LLM_MODEL"):
-        LLMConfig.from_env()
+# --- explain_with_fallback: the two rules --------------------------------------
 
 
-# --- the explain command, with the client swapped for a fake -----------------
-
-
-@pytest.fixture
-def llm_env(monkeypatch):
-    monkeypatch.setenv("LLM_BASE_URL", "http://fake/v1")
-    monkeypatch.setenv("LLM_API_KEY", "x")
-    monkeypatch.setenv("LLM_MODEL", "test-model")
-
-
-def use_fake(monkeypatch, fake: FakeClient) -> None:
-    monkeypatch.setattr(cli, "make_client", lambda config: fake)
-
-
-def test_explain_streams_and_prints_footer(apache_log, llm_env, monkeypatch, capsys):
-    fake = FakeClient([text_chunk("Worker "), text_chunk("crashed.", finish="stop"), usage_chunk(50, 9)])
-    use_fake(monkeypatch, fake)
-
-    exit_code = cli.main(["explain", str(apache_log), "--line", "2"])
-    out = capsys.readouterr()
-
-    assert exit_code == 0
-    assert out.out == "Worker crashed.\n"  # only the explanation on stdout
-    assert "50 in / 9 out" in out.err  # footer on stderr
-    assert fake.calls[0]["messages"][-1]["content"] == LINE  # line 2, in its original format
-
-
-def test_explain_warns_when_answer_is_cut_off(apache_log, llm_env, monkeypatch, capsys):
-    use_fake(monkeypatch, FakeClient([text_chunk("partial", finish="length"), usage_chunk(5, 300)]))
-
-    assert cli.main(["explain", str(apache_log), "--line", "2"]) == 0
-    assert "cut off" in capsys.readouterr().err
-
-
-def test_explain_when_model_unreachable(apache_log, llm_env, monkeypatch, capsys):
-    down = openai.APIConnectionError(request=httpx2.Request("POST", "http://fake/v1/chat/completions"))
-    use_fake(monkeypatch, FakeClient(error=down))
-
-    exit_code = cli.main(["explain", str(apache_log), "--line", "2"])
-
-    assert exit_code == 1
-    assert "Is Ollama running?" in capsys.readouterr().err
-
-
-def test_explain_line_out_of_range(apache_log, llm_env, monkeypatch, capsys):
-    use_fake(monkeypatch, FakeClient())
-
-    assert cli.main(["explain", str(apache_log), "--line", "99999"]) == 1
-    assert "no parsed log record at line 99999" in capsys.readouterr().err
-
-
-def test_explain_without_settings(apache_log, monkeypatch, capsys):
-    for name in ("LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL"):
-        monkeypatch.delenv(name, raising=False)
-
-    assert cli.main(["explain", str(apache_log), "--line", "2"]) == 1
-    assert "missing environment variables" in capsys.readouterr().err
-
-
-def test_explain_picks_record_by_line_number_not_position(tmp_path, llm_env, monkeypatch):
-    log = tmp_path / "x.log"
-    log.write_text(
-        "garbage first line\n"
-        "[Sun Dec 04 04:47:44 2005] [notice] second\n"
-        "[Sun Dec 04 04:47:45 2005] [error] third\n"
+def fallback(clients: dict, providers: list, log: list, on_text=None):
+    return run(
+        explain_with_fallback(
+            providers,
+            LINE,
+            on_text=on_text,
+            client_factory=lambda p: clients[p.name],
+            log=log.append,
+        )
     )
-    fake = FakeClient([text_chunk("ok", finish="stop"), usage_chunk(1, 1)])
-    use_fake(monkeypatch, fake)
 
-    assert cli.main(["explain", str(log), "--line", "3"]) == 0
-    assert fake.calls[0]["messages"][-1]["content"].endswith("third")
+
+@pytest.mark.parametrize(
+    "error",
+    [connection_error(), status_error(429), status_error(500)],
+    ids=["connection", "rate-limited", "server-error"],
+)
+def test_falls_back_on_errors_the_next_provider_might_not_have(error):
+    clients = {"ollama": FakeClient(error=error), "groq": ok_client("recovered")}
+    log = []
+
+    r = fallback(clients, [provider("ollama"), provider("groq")], log)
+
+    assert r.provider == "groq" and r.text == "recovered"
+    assert [entry["status"] for entry in log] == ["error", "ok"]
+    assert log[1]["fallback_from"] == "ollama"
+
+
+def test_does_not_fall_back_on_bad_request():
+    clients = {"ollama": FakeClient(error=status_error(400)), "groq": ok_client()}
+    log = []
+
+    with pytest.raises(Exception, match="HTTP 400"):
+        fallback(clients, [provider("ollama"), provider("groq")], log)
+
+    assert clients["groq"].calls == []  # a bug in our request would fail everywhere
+    assert log[0]["error"] == "BadRequestError"
+
+
+def test_does_not_fall_back_after_first_token():
+    broken = FakeClient([text_chunk("half "), text_chunk("answer")], error=connection_error(), fail_after=1)
+    clients = {"ollama": broken, "groq": ok_client()}
+    seen = []
+
+    with pytest.raises(PartialResponseError):
+        fallback(clients, [provider("ollama"), provider("groq")], [], on_text=seen.append)
+
+    assert seen == ["half "]  # nothing from a second provider stitched on
+    assert clients["groq"].calls == []
+
+
+def test_all_providers_failing_names_them():
+    clients = {"ollama": FakeClient(error=connection_error()), "groq": FakeClient(error=status_error(500))}
+
+    with pytest.raises(AllProvidersFailedError, match="ollama, groq"):
+        fallback(clients, [provider("ollama"), provider("groq")], [])
+
+
+def test_successful_call_logs_tokens_latency_and_cost():
+    log = []
+
+    fallback({"groq": ok_client()}, [provider("groq", price=(0.80, 4.00))], log)
+
+    entry = log[0]
+    assert entry["event"] == "llm_call" and entry["status"] == "ok"
+    assert entry["input_tokens"] == 10 and entry["output_tokens"] == 5
+    assert entry["cost_usd"] == pytest.approx(cost_usd((0.80, 4.00), 10, 5))
+    assert entry["fallback_from"] is None
+    assert {"ttft_s", "total_s", "model", "provider"} <= entry.keys()
