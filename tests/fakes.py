@@ -71,3 +71,29 @@ class FakeClient:
 
 def ok_client(text: str = "ok") -> FakeClient:
     return FakeClient([text_chunk(text, finish="stop"), usage_chunk(10, 5)])
+
+
+# --- non-streaming fake (for extract_event) -----------------------------------
+
+
+def completion_response(content: str, prompt_tokens: int = 20, completion_tokens: int = 10) -> NS:
+    return NS(
+        choices=[NS(message=NS(content=content), finish_reason="stop")],
+        usage=NS(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens),
+    )
+
+
+class FakeCompletionClient:
+    """Fake for non-streaming calls. Returns canned responses in sequence."""
+
+    def __init__(self, responses: list[NS]):
+        self.responses = list(responses)
+        self.calls: list[dict] = []
+        self._index = 0
+        self.chat = NS(completions=NS(create=self._create))
+
+    async def _create(self, **kwargs):
+        self.calls.append(kwargs)
+        resp = self.responses[self._index]
+        self._index += 1
+        return resp

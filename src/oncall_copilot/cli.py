@@ -9,8 +9,10 @@ import openai
 from oncall_copilot.llm import (
     AllProvidersFailedError,
     EmptyResponseError,
+    LLMError,
     PartialResponseError,
     explain_with_fallback,
+    extract_with_fallback,
     format_footer,
     log_call,
 )
@@ -35,6 +37,15 @@ def build_parser() -> argparse.ArgumentParser:
     explain_parser.add_argument("path", type=Path, help="Path to the data file")
     explain_parser.add_argument("--line", type=int, required=True, help="Line number in the file (1-based)")
     explain_parser.add_argument(
+        "--provider",
+        choices=FALLBACK_ORDER,
+        help="Provider to try first (default: LLM_PROVIDER, else ollama). Others are fallbacks.",
+    )
+
+    parse_parser = subparsers.add_parser("parse", help="Extract a structured event from a log line")
+    parse_parser.add_argument("path", type=Path, help="Path to the data file")
+    parse_parser.add_argument("--line", type=int, required=True, help="Line number in the file (1-based)")
+    parse_parser.add_argument(
         "--provider",
         choices=FALLBACK_ORDER,
         help="Provider to try first (default: LLM_PROVIDER, else ollama). Others are fallbacks.",
@@ -120,6 +131,49 @@ def cmd_explain(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_parse(args: argparse.Namespace) -> int:
+    if not args.path.exists():
+        return error(f"{args.path} does not exist")
+
+    result = load_file(args.path)
+    record = next((r for r in result.records if r.line_no == args.line), None)
+    if record is None:
+        return error(f"no parsed log record at line {args.line} of {args.path}")
+
+    try:
+        chain = provider_chain(args.provider)
+    except ConfigError as e:
+        return error(str(e))
+
+    pending_logs: list[dict] = []
+
+    try:
+        extraction = asyncio.run(
+            extract_with_fallback(chain, format_record(record), log=pending_logs.append)
+        )
+    except AllProvidersFailedError as e:
+        return error(f"{e}. Is Ollama running? Is GROQ_API_KEY set?")
+    except openai.APIStatusError as e:
+        return error(f"model API returned HTTP {e.status_code}: {e.message}")
+    except LLMError as e:
+        return error(str(e))
+    finally:
+        for entry in pending_logs:
+            log_call(entry)
+
+    print(extraction.event.model_dump_json(indent=2))
+
+    tokens = f"{extraction.input_tokens} in / {extraction.output_tokens} out tokens"
+    timing = f"total {extraction.total_s:.2f}s"
+    attempts = f"{extraction.attempts} attempt(s)"
+    if extraction.cost_usd is not None:
+        cost = f"${extraction.cost_usd:.6f}"
+    else:
+        cost = f"$0 local (≈ ${extraction.reference_cost_usd:.6f} on claude-haiku-5-5)"
+    print(f"{attempts} · {tokens} · {timing} · {cost}", file=sys.stderr)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     configure_logging()
 
@@ -128,4 +182,6 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_stats(args)
     if args.command == "explain":
         return cmd_explain(args)
+    if args.command == "parse":
+        return cmd_parse(args)
     return error(f"unknown command {args.command}")
